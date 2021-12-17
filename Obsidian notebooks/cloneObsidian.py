@@ -77,8 +77,8 @@ class cloneObsidian:
             
 obsidian_path = r"C:/Users/delbe/Downloads/wut/wut/Post_grad/UBC/Research/records/obsidian notes/Literature/Computational/"
 dest_path = r"./Obsidian notebooks/"
-folders = ["Database System Concepts - Silberschatz"]
-files = ["SQL zoo.md", "Hackerrank SQL.md"]
+folders = ["Web Scraping - Mitchell"]
+files = None
 
 cloneObsidian(folders=folders, files=files, 
             obsidian_path=obsidian_path, 
