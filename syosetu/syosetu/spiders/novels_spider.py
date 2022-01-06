@@ -49,7 +49,7 @@ class Novel(scrapy.Item):
     hyouka_cnt: int = scrapy.Field()
     hyouka_pnt: int = scrapy.Field()
     global_pnt: int = scrapy.Field()
-    ncode: str = scrapy.Field()
+    url: str = scrapy.Field()
     keywords: List[str] = scrapy.Field()
 
 class FindNovelMetrics:
@@ -183,6 +183,7 @@ class FindNovelMetrics:
         output = [f"{name} \t {val}" for name, val in self.data.items()]
         return "\n".join(output)
 
+
 def get_search_order(order: str) -> str:
     """
     Return `yomou.syosetu` search page ordered by `order`
@@ -230,6 +231,7 @@ class NovelSpider(CrawlSpider):
         
         self.max_novel_cnt = max_novel_cnt
         self.get_start_URLs(order, max_page_cnt)
+        self.finder = FindNovelMetrics('')
     
     def get_start_URLs(self, order: str, max_page_cnt: int):
         
@@ -248,6 +250,55 @@ class NovelSpider(CrawlSpider):
     def start_requests(self):
         return super().start_requests()
     
+    @staticmethod 
+    def _find_substring_index(lst: List[str]) -> int:
+        for i, s in enumerate(lst):
+            if '読了時間' in s: return i
+        return -1 
+    
+    @staticmethod
+    def _parse_date(box: scrapy.Selector) -> datetime.date:
+        date = box.xpath("./table//td/following-sibling::*/text()").getall()
+        date = ''.join(''.join(a.strip() for a in date).split())
+        date = re.search("最終更新日.(.*)週", date).group(1)
+        return datetime.strptime(date, "%Y/%m/%d%H:%M") 
+        
+    def _parse(self, box: scrapy.Selector) -> Novel:
+        
+        header = box.xpath("./div[@class='novel_h']")
+        title = header.xpath("./a[@class='tl']/text()").get()
+        link = header.xpath("./a[@class='tl']/@href").get()
+        author = header.xpath("./following-sibling::*/text()").get()
+        
+        tags = header.xpath("./following-sibling::*//a/text()").getall()
+        genre = tags[0]
+        tags = tags[1:]
+        
+        data = header.xpath(a + "/*//*[not(text()='\n')]/text()").getall()
+        
+        status = data[1] 
+        summary = data[2] 
+        post_cnt = re.search(r"\(全(\d*)部分\)", data[2]).group(1)
+        
+        ind = data.index(tags[-1]) + 1
+        word_cnt = re.search("(\d*)(?:文字)", data[ind])
+        
+        metrics = {} 
+        for metric in data[ind+1:]:
+            colon = metric.index(r"：")
+            name = metric[:colon].strip()
+            value = to_int(metric[colon:])
+            metrics[name] = value 
+        
+        date = self._parse_date(box)
+        
+        return Novel(
+            title=title, author=author, url=link,
+            genre=genre, keywords=tags, most_recent_update=date,
+            status=status, summary=summary, post_cnt=post_cnt, 
+            word_cnt=word_cnt, **metrics
+        )
+        
     @staticmethod
     def _format_tbl_str(boxes: List[str]) -> str:
         """Format table strings containng novel metrics"""
@@ -257,15 +308,18 @@ class NovelSpider(CrawlSpider):
             )
             boxes[i] = box 
         return boxes 
-            
+    
     def parse(self, response, **kwargs):
         
         for box in response.css("div.searchkekka_box"):
-            summary = box.css("td div.ex::text").get()
             
-            tbl = format_novel_metric_string(
-                box.xpath("./table//text()").getall()
-            )
+            
+            summary = box.css("td div.ex::text").get()
+            tbl = box.xpath("./table//text()").getall()
+            tbl = self._format_tbl_str(tbl)
+            self.finder.replace_data(tbl)
+            
+            itm = self.finder.create_novel_item()
             
     def parse_novel(self):
         pass 
