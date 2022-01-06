@@ -1,3 +1,5 @@
+# coding=utf8
+
 # Copyright (c) 2022 Delbert Yip
 # 
 # This software is released under the MIT License.
@@ -9,8 +11,10 @@ from scrapy.spiders import Rule
 from scrapy.linkextractors import LinkExtractor
 
 from datetime import datetime 
-from typing import List, Dict, Union
+from typing import Callable, List, Dict, Union, Tuple, Any
 
+import logging
+from scrapy.utils.trackref import NoneType 
 import validators
 
 import regex as re 
@@ -19,61 +23,16 @@ import regex as re
 
 SEARCH_RESULTS_XPATH = r"//div[@id='main_search'][1]/div[@class='searchkekka_box'][1]"
 
-REMOVE_NEWLINE = re.compile(r"[\n]*"),
+JAPANESE_SCRIPT_REGEX = "\p{Han}\p{Katakana}\p{Hiragana}"
 
-class FindNovelMetrics:
-    patterns = {
-        "wordcnt" : re.compile(r"([\d,]+)(?:文字)"),
-        "postcnt" : re.compile(r"(?:\(全)([\d]*)(?:部分\))"),
-        "words" : r"%s[\s\D\W]{1,5}(.*)\n"
-        "numbers" : r"(?:%s)[\s\D\W]{1,5}([\d,]*)",
-        "dates" : re.compile(
-            "(?:最終更新日)[\s\D\W]{1,5}(\d{4}\/\d{2}\/\d{2}\s\d{2}:\d{2})"
-        ),
-        "rank" : re.compile(r"([\p{Han}]{1,2})間pt[\s\D\W]{1,5}([\d,]*)pt")
-    }
-
-    metrics = {
-        "rank" : [''],
-        "dates" : [''],
-        "words" : ["ジャンル", "キーワード"],
-        "numbers" : ["総合ポイント", "週別ユニークユーザ", 
-                    "レビュー数", "ブックマーク", "評価人数", 
-                    "評価ポイント"],
-    }
+REMOVE_PUNCT_REGEX = re.compile(
+    f"[^{JAPANESE_SCRIPT_REGEX}\s\n\w\d]*"
+)
     
-    def __init__(self, text: str) -> None:
-        self.text = text
-
-    def find(self):
-        
-        T = self.text 
-        data: Dict[str, Union[str, int, List[str]]] = dict()
-        
-        data['word_cnt'] = self.patterns['wordcnt'].search(T)
-        data['post_cnt'] = self.patterns['postcnt'].search(T)
-
-        for group, names in self.metrics.items():
-            if group == 'rank':
-                res = self.patterns['rank'].findall(T).groups()
-                
-                # (period, score)
-                data['rank'] = [
-                    (a, b) for a, b in zip(res[::2], res[1::2])
-                ]
-                continue     
-            
-            elif group == 'dates':
-                res = self.patterns['dates'].search(T).groups()[0]
-                data['most_recent_update'] = datetime.strptime(
-                    res, r"%Y/%m/%d %H:%M"
-                )
-                continue 
-            
-            for m in group:
-                
 # ---------------------------------------------------------------------------- #
 
+def to_int(number: str) -> int:
+    return int( re.sub("\D*", '', number) )
 
 class Novel(scrapy.Item):
     """Novel information"""
@@ -88,11 +47,141 @@ class Novel(scrapy.Item):
     bookmark_cnt: int = scrapy.Field()
     review_cnt: int = scrapy.Field()
     hyouka_cnt: int = scrapy.Field()
-    hyouka_point: int = scrapy.Field()
-    global_point: int = scrapy.Field()
+    hyouka_pnt: int = scrapy.Field()
+    global_pnt: int = scrapy.Field()
     ncode: str = scrapy.Field()
     keywords: List[str] = scrapy.Field()
 
+class FindNovelMetrics:
+    patterns = {
+        "word_cnt" : re.compile(r"([\d,]+)(?:文字)"),
+        "post_cnt" : re.compile(r"(?:\(全)([\d]*)(?:部分\))"),
+        "words" : f"%s[\s\D\W](.*)(?:%s)",
+        "numbers" : r"%s[\s\D\W]{1,5}([\d,]*)",
+        "dates" : re.compile(
+            r"(?:最終更新日)[\s\D\W](\d{4}\/\d{2}\/\d{2}\s\d{2}:\d{2})"
+        ),
+        "rank" : re.compile(
+            r"([\p{Han}]{1,2})間pt[\s\D\W]{1,5}([\d,]*)pt"
+        )
+    }
+
+    metrics: Dict[str, Union[list, List[tuple]]] = {
+        "rank" : [],
+        "dates" : [],
+        "words" : [(("ジャンル", "キーワード"), "genre"), 
+                    (("キーワード", "最終更新日"), "keywords")],
+        "numbers" : [("総合ポイント", "global_pnt"), 
+                    ("週別ユニークユーザ", "weekly_unique_cnt"), 
+                    ("レビュー数", "review_cnt"), 
+                    ("ブックマーク", "bookmark_cnt"), 
+                    ("評価人数", "hyouka_cnt"),
+                    ("評価ポイント", "hyouka_pnt")],
+    }
+    
+    ERR_MSG = "Could not extract data for metric < {m} >\n{e}"
+    
+    data: Dict[str, Union[str, int, List[str]]] = dict()
+    
+    def __init__(self, text: str) -> None:
+        self.text = text
+        # self.logger = logger 
+
+    @staticmethod
+    def _filterSearchByType(
+        search: List[str], serializer=str, *args
+    ) -> Union[int, str, NoneType]:
+        """Discard regex matches that can't be serialized"""
+        
+        for s in search:
+            try: 
+                return serializer(s, *args)
+            except ValueError as e:
+                logging.error(e)
+        
+        logging.warning(f"Failed to serialize:\n{search}")
+        return None 
+    
+    def _findContextSpecific(
+        self, data: Dict[str, Any], group: str, names: List[Any]
+    ) -> Dict[str, Any]:
+        
+        """Context-specific regex patterns in 'word' and 'numbers'"""
+        
+        serializer = str if (group == 'words') else to_int 
+        
+        for jp, eng in names:
+            
+            try:
+                res = re.findall(self.patterns[group] % jp, self.text)
+                res = self._filterSearchByType(res, serializer=serializer)
+                data[eng] = res
+                    
+            except AttributeError as e:
+        
+                logging.error(self.ERR_MSG.format(
+                    m=f"{group}/{eng}", e=e))
+        
+                data[eng] = None
+        
+        return data 
+    
+    def find(self) -> None:
+        
+        T = self.text 
+        data = self.data 
+        
+        for name in ['word_cnt', 'post_cnt']:
+            num = self.patterns[name].search(T).group(1)
+            data[name] = to_int(num)
+
+        for group, names in self.metrics.items():
+            
+            if group not in self.patterns: 
+                logging.error(
+                    KeyError(f"No regex pattern matching {group}.")
+                )
+                continue
+            
+            # pre-compiled regex patterns 
+            try:
+                if group == 'rank':
+                    # List[ (period, score) ]
+                    res = self.patterns['rank'].findall(T)
+                    
+                    if res:
+                        for i, r in enumerate(res):
+                            res[i] = (r[0], to_int(r[1]))
+                    
+                    data['rank'] = res 
+                    continue 
+                
+                elif group == 'dates':
+                    res = self.patterns['dates'].search(T).group(1)
+                    data['most_recent_update'] = datetime.strptime(
+                        res, r"%Y/%m/%d %H:%M"
+                    )
+                    continue 
+                
+            except AttributeError as e:
+                logging.error(self.ERR_MSG.format(m=group, e=e))
+                data[group] = None
+            
+            # 'words' and 'numbers' 
+            data = self._findContextSpecific(data, group, names)
+                            
+        return 
+    
+    def replace_data(self, new_text: str) -> None:
+        self.text = new_text 
+        self.data = dict()
+    
+    def create_novel_item(self) -> Novel:
+        return Novel(**self.data)
+    
+    def __repr__(self) -> str:
+        output = [f"{name} \t {val}" for name, val in self.data.items()]
+        return "\n".join(output)
 
 def get_search_order(order: str) -> str:
     """
@@ -119,8 +208,8 @@ def get_search_order(order: str) -> str:
 
 
 def format_novel_metric_string(txt: List[str]) -> str:
-    out = ",".join([s.strip() for s in txt if not s.isspace()])
-    return REMOVE_NEWLINE.sub('', )
+    out = re.sub('[\n\s]*', '', ''.join(txt))
+    return out 
     
 class NovelSpider(CrawlSpider):
     name = 'novels'    
@@ -159,6 +248,16 @@ class NovelSpider(CrawlSpider):
     def start_requests(self):
         return super().start_requests()
     
+    @staticmethod
+    def _format_tbl_str(boxes: List[str]) -> str:
+        """Format table strings containng novel metrics"""
+        for i, box in enumerate(boxes):
+            box = ' '.join(
+                (''.join(box)).split()
+            )
+            boxes[i] = box 
+        return boxes 
+            
     def parse(self, response, **kwargs):
         
         for box in response.css("div.searchkekka_box"):
@@ -168,12 +267,5 @@ class NovelSpider(CrawlSpider):
                 box.xpath("./table//text()").getall()
             )
             
-            word_cnt = METRIC_PATTERNS['wordcnt'].search(tbl)
-            post_cnt = METRIC_PATTERNS['postcnt'].search(tbl)
-            
-            for category in NOVEL_METRICS:
-                
-            
     def parse_novel(self):
         pass 
-    
